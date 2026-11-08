@@ -3,17 +3,37 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <QPointer>
 #include <QWindow>
 
 #import <Cocoa/Cocoa.h>
 
 #include "systray.h"
+#include "tray/trayiconanimation.h"
 
 static_assert(__has_feature(objc_arc), "systray_mac_common requires ARC.");
 
 Q_LOGGING_CATEGORY(lcMacSystrayCommon, "nextcloud.gui.macsystraycommon")
 
 namespace OCC {
+
+void connectMacOSTrayMotionPreference(TrayIconAnimation *animation)
+{
+    const auto updatePreference = [animation = QPointer<TrayIconAnimation>(animation)] {
+        if (animation) {
+            animation->setReducedMotion(NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion);
+        }
+    };
+    updatePreference();
+    auto *center = NSWorkspace.sharedWorkspace.notificationCenter;
+    const auto observer = [center addObserverForName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+                                              object:nil
+                                               queue:NSOperationQueue.mainQueue
+                                          usingBlock:^(NSNotification *) { updatePreference(); }];
+    QObject::connect(animation, &QObject::destroyed, [center, observer] {
+        [center removeObserver:observer];
+    });
+}
 
 double menuBarThickness()
 {
