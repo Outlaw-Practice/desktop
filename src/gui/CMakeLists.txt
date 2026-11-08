@@ -298,6 +298,8 @@ IF( APPLE )
     list(APPEND client_SRCS
         cocoainitializer_mac.mm
         systray_mac_common.mm
+        tray/trayiconanimation.h
+        tray/trayiconanimation.cpp
         notificationsoundplayer_mac.mm
         macOS/singleinstancemanager_mac.mm
         systray_mac_usernotifications.mm

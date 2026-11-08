@@ -1,5 +1,17 @@
 <RCC>
     <qresource prefix="/client">
+        <file>theme/white/outlaw-tray-connected.svg</file>
+        <file>theme/black/outlaw-tray-connected.svg</file>
+        <file>theme/black/outlaw-tray-state-sync.svg</file>
+        <file>theme/black/outlaw-tray-state-offline.svg</file>
+        <file>theme/black/outlaw-tray-state-pause.svg</file>
+        <file>theme/black/outlaw-tray-state-warning.svg</file>
+        <file>theme/black/outlaw-tray-state-error.svg</file>
+        <file>theme/white/outlaw-tray-state-sync.svg</file>
+        <file>theme/white/outlaw-tray-state-offline.svg</file>
+        <file>theme/white/outlaw-tray-state-pause.svg</file>
+        <file>theme/white/outlaw-tray-state-warning.svg</file>
+        <file>theme/white/outlaw-tray-state-error.svg</file>
         <file alias="theme/colored/@APPLICATION_ICON_NAME@-icon-16.png">theme/colored/16-@APPLICATION_ICON_NAME@-icon.png</file>
         <file alias="theme/colored/@APPLICATION_ICON_NAME@-icon-24.png">theme/colored/24-@APPLICATION_ICON_NAME@-icon.png</file>
         <file alias="theme/colored/@APPLICATION_ICON_NAME@-icon-32.png">theme/colored/32-@APPLICATION_ICON_NAME@-icon.png</file>
