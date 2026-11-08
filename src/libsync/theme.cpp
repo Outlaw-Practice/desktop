@@ -89,6 +89,8 @@ bool isWindows11OrGreater() {
 
 namespace OCC {
 
+using namespace Qt::StringLiterals;
+
 Q_LOGGING_CATEGORY(lcTheme, "nextcloud.gui.theme", QtInfoMsg)
 
 Theme *Theme::_instance = nullptr;
@@ -291,6 +293,17 @@ QIcon Theme::applicationIcon() const
  */
 QIcon Theme::themeIcon(const QString &name, bool sysTray) const
 {
+#ifdef Q_OS_MACOS
+    if (sysTray && appNameGUI() == u"Outlaw Cloud"_s) {
+        const auto trayName = name == u"state-ok"_s ? u"connected"_s : name;
+        const auto path = u"%1%2/outlaw-tray-%3.svg"_s.arg(QString::fromLatin1(themePrefix), systrayIconFlavor(true), trayName);
+        if (QFile::exists(path)) {
+            // Keep the compass colors even when the mono-icons preference is enabled.
+            return QIcon(path);
+        }
+    }
+#endif
+
     QString flavor;
     if (sysTray) {
         flavor = systrayIconFlavor(_mono);
@@ -1200,6 +1213,11 @@ void Theme::setStartLoginFlowAutomatically(bool startLoginFlowAuto)
 void Theme::systemPaletteHasChanged()
 {
     qCInfo(lcTheme()) << "system palette changed";
+#ifdef Q_OS_MACOS
+    if (appNameGUI() == u"Outlaw Cloud"_s) {
+        Q_EMIT systrayUseMonoIconsChanged(_mono);
+    }
+#endif
 #ifdef Q_OS_WIN
     if (darkMode() && !isWindows11OrGreater()) {
         qApp->setPalette(reserveDarkPalette);

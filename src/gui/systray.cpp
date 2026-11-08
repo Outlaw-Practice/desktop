@@ -24,6 +24,7 @@
 
 #ifdef Q_OS_MACOS
 #include "foregroundbackground_interface.h"
+#include "tray/trayiconanimation.h"
 #endif
 
 #include <QCursor>
@@ -145,6 +146,12 @@ void Systray::openUrlInBrowser(const QUrl &url) const
 Systray::Systray()
     : QSystemTrayIcon(nullptr)
 {
+#ifdef Q_OS_MACOS
+    if (Theme::instance()->appNameGUI() == u"Outlaw Cloud"_s) {
+        _iconAnimation = new TrayIconAnimation(*this);
+        connectMacOSTrayMotionPreference(_iconAnimation);
+    }
+#endif
 #if defined(Q_OS_MACOS) && __MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_X_VERSION_10_14 && defined(BUILD_OWNCLOUD_OSX_BUNDLE)
     setUserNotificationCenterDelegate();
     checkNotificationAuth(MacNotificationAuthorizationOptions::Default); // No provisional auth, ask user explicitly first time
@@ -179,6 +186,19 @@ void Systray::create()
 {
     hideWindow();
     Q_EMIT activated(QSystemTrayIcon::ActivationReason::Unknown);
+}
+
+void Systray::setIcon(const QIcon &icon, bool syncing)
+{
+#ifdef Q_OS_MACOS
+    if (_iconAnimation) {
+        _iconAnimation->setIcon(icon, syncing);
+        return;
+    }
+#else
+    Q_UNUSED(syncing)
+#endif
+    QSystemTrayIcon::setIcon(icon);
 }
 
 void Systray::showWindow(WindowPosition position)

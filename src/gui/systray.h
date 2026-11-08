@@ -25,6 +25,8 @@ class QGuiApplication;
 
 namespace OCC {
 
+class TrayIconAnimation;
+
 class AccessManagerFactory : public QQmlNetworkAccessManagerFactory
 {
 public:
@@ -53,6 +55,7 @@ double menuBarThickness();
 bool showMacOSTrayPopup(const QRect &iconRect);
 void hideMacOSTrayPopup();
 bool macOSTrayPopupWasVisibleAtCurrentMouseDown();
+void connectMacOSTrayMotionPreference(TrayIconAnimation *animation);
 #endif
 
 /**
@@ -71,6 +74,8 @@ class Systray : public QSystemTrayIcon
 public:
     static Systray *instance();
     ~Systray() override = default;
+
+    void setIcon(const QIcon &icon, bool syncing = false);
 
     enum class TaskBarPosition { Bottom, Left, Top, Right };
     Q_ENUM(TaskBarPosition);
@@ -225,6 +230,9 @@ private:
     [[nodiscard]] QPoint computeNotificationPosition(int width, int height, int spacing = 20, NotificationPosition position = NotificationPosition::Default) const;
 
     bool _isOpen = false;
+#ifdef Q_OS_MACOS
+    TrayIconAnimation *_iconAnimation = nullptr;
+#endif
     bool _isTrayContextMenuVisible = false;
     std::unique_ptr<QQmlApplicationEngine> _trayEngine;
     QPointer<QMenu> _contextMenu;

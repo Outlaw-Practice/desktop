@@ -489,7 +489,7 @@ void ownCloudGui::slotComputeOverallSyncStatus()
     }
 
     QIcon statusIcon = Theme::instance()->syncStateIcon(iconStatus, true);
-    _tray->setIcon(statusIcon);
+    _tray->setIcon(statusIcon, iconStatus == SyncResult::SyncRunning || iconStatus == SyncResult::NotYetStarted);
 
     // create the tray blob message, check if we have an defined state
 #ifdef BUILD_FILE_PROVIDER_MODULE
