@@ -1208,6 +1208,72 @@ public final class FilesDatabaseManager: Sendable {
         }
     }
 
+    /// Include changes persisted by a previous scan, even if its parent etag was unchanged.
+    func pendingReachableWorkingSetChanges(since date: Date) -> (updated: [SendableItemMetadata], deleted: [SendableItemMetadata])? {
+        guard let prior = pendingWorkingSetChanges(since: date) else { return nil }
+        return read("Could not gather cached working-set discoveries.") { db in
+            let materialised = try ItemMetadataRecord.filter(ItemMetadataRecord.isMaterialised)
+                .fetchRecords(db, logger: logger).map(\.metadata)
+            let identifiers = Set(materialised.map(\.ocId))
+            var paths = Set<String>()
+            for item in materialised {
+                var path = item.directory ? item.remotePath() : item.serverUrl
+                while path.count >= account.davFilesUrl.count {
+                    paths.insert(path.precomposedStringWithCanonicalMapping)
+                    guard let slash = path.lastIndex(of: "/") else { break }
+                    path = String(path[..<slash])
+                }
+            }
+            let rows = try ItemMetadataRecord.filter(ItemMetadataRecord.syncedAfter(date))
+                .fetchRecords(db, logger: logger).map(\.metadata).filter {
+                    !($0.isTrashed || $0.isLockFileOfLocalOrigin)
+                        && (identifiers.contains($0.ocId) || paths.contains($0.serverUrl.precomposedStringWithCanonicalMapping))
+                }
+            let changes = ChangeSet(mergingUpdated: [prior.updated, rows.filter { !$0.deleted }],
+                                    deleted: [prior.deleted, rows.filter(\.deleted)])
+            return (changes.createdAndUpdated, changes.deleted)
+        }
+    }
+
+    /// A replacement at the same path must wait until deletion reconciliation completes.
+    func updatesWithoutPathReplacements(_ updates: [SendableItemMetadata]) -> [SendableItemMetadata]? {
+        read("Could not check partial working-set replacements.") { db in
+            var countsByParent = [String: [String: Int]]()
+            return try updates.filter { item in
+                let parent = item.serverUrl.precomposedStringWithCanonicalMapping
+                if countsByParent[parent] == nil {
+                    let siblings = try ItemMetadataRecord
+                        .filter(ItemMetadataRecord.hasServerUrl(equalTo: parent, includingDescendants: false))
+                        .fetchRecords(db, logger: logger)
+                    countsByParent[parent] = Dictionary(grouping: siblings, by: {
+                        $0.normalizedFileName.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+                    }).mapValues(\.count)
+                }
+                let name = item.fileName.precomposedStringWithCanonicalMapping
+                    .folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+                return countsByParent[parent]?[name] == 1
+            }
+        }
+    }
+
+    /// Updates a visible container still needs after another reader persisted its server snapshot.
+    /// Same-path identity replacements wait for their ordinary deletion reconciliation.
+    func pendingContainerUpdates(serverUrl: String, since date: Date) -> [SendableItemMetadata]? {
+        read("Could not gather cached container discoveries.") { db in
+            let siblings = try ItemMetadataRecord
+                .filter(ItemMetadataRecord.hasServerUrl(equalTo: serverUrl, includingDescendants: false))
+                .fetchRecords(db, logger: logger)
+            let counts = Dictionary(grouping: siblings, by: {
+                $0.normalizedFileName.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+            }).mapValues(\.count)
+            return siblings.filter { !$0.deleted && $0.syncTime > date }.compactMap { row in
+                let name = row.normalizedFileName.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+                guard counts[name] == 1, !row.isLockFileOfLocalOrigin else { return nil }
+                return row.metadata
+            }
+        }
+    }
+
     public func itemsMetadataByFileNameSuffix(suffix: String) -> [SendableItemMetadata] {
         logger.debug("Trying to find files matching pattern \"\(suffix)\".")
 

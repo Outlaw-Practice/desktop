@@ -140,6 +140,20 @@ extension DatabaseTestSuites {
             #expect(manager.materialisedItemMetadatas(account: "") == nil)
         }
 
+        @Test func cachedDiscoveryReadsReportFailureAsNil() throws {
+            let date = Date(timeIntervalSince1970: 0)
+            let row = DatabaseTestSuites.makeFile(ocId: "cached", fileName: "cached.txt")
+            #expect(manager.pendingReachableWorkingSetChanges(since: date)?.updated.isEmpty == true)
+            #expect(manager.pendingContainerUpdates(serverUrl: row.serverUrl, since: date) == [])
+            #expect(manager.updatesWithoutPathReplacements([row]) == [])
+
+            try manager.breakTableForTesting(ItemMetadataRecord.databaseTableName)
+
+            #expect(manager.pendingReachableWorkingSetChanges(since: date) == nil)
+            #expect(manager.pendingContainerUpdates(serverUrl: row.serverUrl, since: date) == nil)
+            #expect(manager.updatesWithoutPathReplacements([row]) == nil)
+        }
+
         @Test func pendingWorkingSetChangesReportFailureAsNil() throws {
             var row = DatabaseTestSuites.makeFile(ocId: "changed", fileName: "changed.txt")
             row.downloaded = true

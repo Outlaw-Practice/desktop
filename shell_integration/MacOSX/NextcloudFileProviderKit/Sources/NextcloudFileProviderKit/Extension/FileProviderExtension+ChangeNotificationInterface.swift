@@ -5,6 +5,7 @@ import FileProvider
 
 extension FileProviderExtension: ChangeNotificationInterface {
     public func notifyChange() {
+        workingSetRefresh.requestRefresh()
         guard let fpManager = NSFileProviderManager(for: domain) else {
             logger.error("Could not get file provider manager for domain \(domain.displayName), cannot notify changes")
             return

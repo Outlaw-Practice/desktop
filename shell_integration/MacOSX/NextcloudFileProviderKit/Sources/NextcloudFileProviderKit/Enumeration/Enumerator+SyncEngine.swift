@@ -210,6 +210,35 @@ extension Enumerator {
         log: any FileProviderLogging
     ) async -> RemoteReadResult {
         guard !isCancelled() else { return RemoteReadResult(error: .cancelled) }
+        let key = account.ncKitAccount + "|" + serverUrl.precomposedStringWithCanonicalMapping
+        let depthValue = depth.rawValue
+        return await RemoteReadCoordinator.shared.perform(key: key) {
+            await performServerRead(
+                serverUrl, pageSettings: pageSettings, account: account,
+                remoteInterface: remoteInterface, dbManager: dbManager, domain: domain,
+                enumeratedItemIdentifier: enumeratedItemIdentifier,
+                expectedDirectoryOcId: expectedDirectoryOcId,
+                depth: EnumerateDepth(rawValue: depthValue)!, taskHandler: taskHandler,
+                isCancelled: isCancelled, log: log
+            )
+        }
+    }
+
+    private static func performServerRead(
+        _ serverUrl: String,
+        pageSettings: (page: NSFileProviderPage?, index: Int, size: Int)? = nil,
+        account: Account,
+        remoteInterface: RemoteInterface,
+        dbManager: FilesDatabaseManager,
+        domain: NSFileProviderDomain? = nil,
+        enumeratedItemIdentifier: NSFileProviderItemIdentifier? = nil,
+        expectedDirectoryOcId: String? = nil,
+        depth: EnumerateDepth = .targetAndDirectChildren,
+        taskHandler: @Sendable @escaping (URLSessionTask) -> Void = { _ in },
+        isCancelled: @Sendable @escaping () -> Bool = { Task.isCancelled },
+        log: any FileProviderLogging
+    ) async -> RemoteReadResult {
+        guard !isCancelled() else { return RemoteReadResult(error: .cancelled) }
         let logger = FileProviderLogger(category: "Enumerator", log: log)
 
         logger.debug("Starting to read server URL.", [.url: serverUrl])

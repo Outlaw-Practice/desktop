@@ -51,6 +51,7 @@ import OSLog
     ///
     /// The individual interr
     ///
+    let connectionsLock = NSLock()
     var connections = Set<NSXPCConnection>()
 
     public var listener = NSXPCListener.anonymous()
@@ -64,7 +65,16 @@ import OSLog
 
     var ncAccount: Account?
     var dbManager: FilesDatabaseManager?
+    /// Package tests supply an isolated directory; the extension uses its domain container.
+    var databaseDirectory: URL?
     var ignoredFiles: IgnoredFilesMatcher?
+    let workingSetRefresh = WorkingSetRefreshState()
+    private let rootRefreshTimer = DispatchSource.makeTimerSource(
+        queue: DispatchQueue(label: "com.nextcloud.fileprovider.root-refresh", qos: .utility)
+    )
+    @MainActor private var rootRefreshInFlight = false
+    @MainActor private var rootRefreshAccount: Account?
+    @MainActor private var rootRefreshEtag: String?
     lazy var ncKitBackground = NKBackground(nkCommonInstance: ncKit.nkCommonInstance)
 
     var syncActions = Set<UUID>()
@@ -127,6 +137,16 @@ import OSLog
         keychain = Keychain(domain: domain, log: log)
         super.init()
         observeBlockSync()
+        rootRefreshTimer.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in await self?.refreshRoot() }
+        }
+        rootRefreshTimer.schedule(deadline: .now() + 5, repeating: 5)
+        rootRefreshTimer.resume()
+    }
+
+    deinit {
+        rootRefreshTimer.cancel()
+        workingSetRefresh.requestRefresh()
     }
 
     public func invalidate() {
@@ -136,6 +156,30 @@ import OSLog
         // The running drain nudges through this instance's manager and database, so it stops; what is still pending waits for the next enqueue's drain.
         AncestorRefreshCoalescer.shared(for: domain.identifier).cancel()
         dbManager?.checkpointForShutdown()
+        rootRefreshTimer.cancel()
+        workingSetRefresh.requestRefresh()
+    }
+
+    /// Poll the account root, whose etag changes when content changes anywhere below it.
+    @MainActor func refreshRoot() async {
+        guard !rootRefreshTimer.isCancelled, !rootRefreshInFlight, !blockSync,
+              let account = ncAccount, ignoredFiles != nil else { return }
+        rootRefreshInFlight = true
+        defer { rootRefreshInFlight = false }
+        let options = NKRequestOptions(timeout: 10, checkInterceptor: false, queue: .global(qos: .utility))
+        let (_, files, _, error) = await ncKit.enumerate(
+            remotePath: account.davFilesUrl, depth: .target, account: account, options: options
+        )
+        guard !rootRefreshTimer.isCancelled, !blockSync, ncAccount == account else { return }
+        guard error == .success, let root = files.first, root.directory else { return }
+        ncKit.clearAccountErrorState(for: account.ncKitAccount)
+        manager?.signalErrorResolved(NSFileProviderError(.serverUnreachable)) { _ in }
+        manager?.signalErrorResolved(NSFileProviderError(.notAuthenticated)) { _ in }
+        guard rootRefreshAccount != account || rootRefreshEtag != root.etag else { return }
+        rootRefreshAccount = account
+        rootRefreshEtag = root.etag
+        logger.info("Account root changed; requesting working-set refresh.")
+        notifyChange()
     }
 
     func insertSyncAction(_ actionId: UUID) {
@@ -579,6 +623,7 @@ import OSLog
             remoteInterface: ncKit,
             dbManager: dbManager,
             domain: domain,
+            workingSetRefresh: workingSetRefresh,
             log: log
         )
     }
@@ -908,21 +953,10 @@ import OSLog
 
         ncKit.appendSession(account: account, userAgent: userAgent)
 
-        var authAttemptState = AuthenticationAttemptResultState.connectionError // default
-
-        // Retry a few times if we have a connection issue
-        let options = NKRequestOptions(checkInterceptor: false)
-
-        for authTimeout in AuthenticationTimeouts {
-            authAttemptState = await ncKit.tryAuthenticationAttempt(account: account, options: options)
-
-            guard authAttemptState == .connectionError else {
-                break
-            }
-
-            logger.info("Authentication try timed out. Trying again soon.")
-            try? await Task.sleep(nanoseconds: authTimeout)
-        }
+        // Finder is waiting for this result. Return connection failures so the user can retry.
+        let options = NKRequestOptions(timeout: 10, checkInterceptor: false)
+        let authAttemptState = await ncKit.tryAuthenticationAttempt(account: account, options: options)
+        let setupError: NSError?
 
         switch authAttemptState {
             case .authenticationError:
@@ -930,13 +964,13 @@ import OSLog
                 completionHandler?(NSError(.invalidCredentials))
                 return
             case .connectionError:
-                // Despite multiple connection attempts we are still getting connection issues.
-                // Connection error should be provided
                 logger.error("Authentication failed due to a connection error.")
-                completionHandler?(NSError(.connection))
-                return
+                // The credentials were not rejected. Keep the account configured so ordinary
+                // Finder requests can recover when connectivity returns, without a new XPC handoff.
+                setupError = NSError(.connection)
             case .success:
                 logger.info("Successfully authenticated.")
+                setupError = nil
         }
 
         // Opening the database may import or migrate it, so it happens off the main actor.
@@ -945,6 +979,7 @@ import OSLog
         do {
             databaseManager = try FilesDatabaseManager(
                 account: account,
+                databaseDirectory: databaseDirectory,
                 fileProviderDomainIdentifier: domain.identifier,
                 log: log
             )
@@ -972,9 +1007,18 @@ import OSLog
             )
             dbManager = databaseManager
 
-            ncKit.setup(groupIdentifier: Bundle.main.bundleIdentifier!)
+            if let identifier = Bundle.main.bundleIdentifier {
+                ncKit.setup(groupIdentifier: identifier)
+            }
+            if setupError == nil {
+                manager?.signalErrorResolved(NSFileProviderError(.serverUnreachable)) { error in
+                    if error != nil {
+                        self.logger.error("Could not resolve the previous server-unreachable error after authentication.")
+                    }
+                }
+            }
             signalAccountReady()
-            completionHandler?(nil)
+            completionHandler?(setupError)
             signalEnumeratorAfterAccountSetup()
         }
     }

@@ -616,6 +616,8 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
         readOperationCountLock.withLock { lockedReadOperationCount }
     }
 
+    public var enumerateSuspensionHandler: (@Sendable (String) async -> Void)?
+
     /// When non-nil, the upload mock truncates the modification date returned to
     /// the caller to this precision (in seconds) — simulating Nextcloud's
     /// `Last-Modified` IMF-fixdate, which is second-precision even when we sent
@@ -1261,6 +1263,7 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
     ) async -> (account: String, files: [NKFile], data: AFDataResponse<Data>?, error: NKError) {
         // Increment read operation counter
         readOperationCountLock.withLock { lockedReadOperationCount += 1 }
+        await enumerateSuspensionHandler?(remotePath)
 
         var remotePath = remotePath
 

@@ -14,15 +14,15 @@ extension FileProviderExtension: NSXPCListenerDelegate {
 
         newConnection.interruptionHandler = {
             self.logger.info("XPC connection interrupted!")
-            self.connections.remove(newConnection)
+            _ = self.connectionsLock.withLock { self.connections.remove(newConnection) }
         }
 
         newConnection.invalidationHandler = {
             self.logger.info("XPC connection invalidated!")
-            self.connections.remove(newConnection)
+            _ = self.connectionsLock.withLock { self.connections.remove(newConnection) }
         }
 
-        connections.insert(newConnection)
+        _ = connectionsLock.withLock { connections.insert(newConnection) }
         newConnection.resume()
 
         let remoteObjectProxy = newConnection.remoteObjectProxyWithErrorHandler { error in
