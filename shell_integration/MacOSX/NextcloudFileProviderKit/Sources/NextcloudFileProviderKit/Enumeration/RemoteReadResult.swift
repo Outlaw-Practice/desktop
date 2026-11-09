@@ -11,7 +11,7 @@ import NextcloudKit
 /// `(_, _, _, _, _, error)`. Field access (`result.metadatas`, `result.error`, …) documents at
 /// each call site which parts of the read it actually consumes.
 ///
-struct RemoteReadResult {
+struct RemoteReadResult: Sendable {
     ///
     /// The items read from the server. For depth-1 reads the target directory is the first element.
     /// `nil` when the read failed (see ``error``).

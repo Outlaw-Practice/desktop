@@ -19,11 +19,12 @@ extension Enumerator {
     /// database write that derives the changes failed and is reported as an error.
     ///
     func enumerateContainerChanges(
-        for observer: NSFileProviderChangeObserver, anchor: NSFileProviderSyncAnchor
+        for observer: NSFileProviderChangeObserver, since date: Date, anchor: NSFileProviderSyncAnchor
     ) {
         logger.info("Enumerating changes in item.", [.url: serverUrl])
 
         let anchorKey = String(data: anchor.rawValue, encoding: .utf8) ?? ""
+        let targetAnchor = syncAnchor(at: Date())
 
         // No matter what happens here we finish enumeration in some way, either from the error
         // handling below or from draining the change buffer.
@@ -62,12 +63,12 @@ extension Enumerator {
             )
             let readError = readResult.error
 
-            guard readError == nil else {
+            if let readError, !readError.isNoChangesError {
                 logger.error("Finished enumerating changes.", [.url: serverUrl, .error: readError])
 
-                let error = readError?.fileProviderError(handlingNoSuchItemErrorUsingItemIdentifier: enumeratedItemIdentifier) ?? NSFileProviderError(.cannotSynchronize)
+                let error = readError.fileProviderError(handlingNoSuchItemErrorUsingItemIdentifier: enumeratedItemIdentifier) ?? NSFileProviderError(.cannotSynchronize)
 
-                if readError!.isNotFoundError {
+                if readError.isNotFoundError {
                     logger.info("404 error means item no longer exists. Deleting metadata and reporting deletion without error.", [.url: serverUrl])
 
                     guard let itemMetadata = enumeratedItemMetadata else {
@@ -89,7 +90,7 @@ extension Enumerator {
                         observer,
                         updated: [],
                         deleted: [itemMetadata],
-                        anchor: anchor,
+                        anchor: targetAnchor,
                         moreComing: false,
                         acknowledgement: nil,
                         account: account,
@@ -97,17 +98,13 @@ extension Enumerator {
                         dbManager: dbManager
                     )
                     return
-                } else if readError!.isNoChangesError { // All is well, just no changed etags
-                    logger.info("Error was to say no changed files - not bad error. Finishing change enumeration.")
-                    observer.finishEnumeratingChanges(upTo: anchor, moreComing: false)
-                    return
                 }
 
                 observer.finishEnumeratingWithError(error)
                 return
             }
 
-            guard let changes = readResult.changes else {
+            guard let changes = readError?.isNoChangesError == true ? ChangeSet() : readResult.changes else {
                 // The database write that derives the change set failed; report an error to the
                 // framework, mirroring the previous nil-guard behavior of completeChangesObserver.
                 let error = NSError.fileProviderErrorForNonExistentItem(withIdentifier: enumeratedItemIdentifier)
@@ -121,18 +118,26 @@ extension Enumerator {
             // Sort created+updated parents-before-children (see completeChangesBatch) and buffer the
             // full set so it can be delivered one batch at a time across the framework's moreComing
             // re-invocations without exceeding the per-batch limit.
-            let sortedUpdated = changes.createdAndUpdated
-                .sorted { $0.remotePath().count < $1.remotePath().count }
+            guard let pending = dbManager.pendingContainerUpdates(serverUrl: serverUrl, since: date) else {
+                observer.finishEnumeratingWithError(NSFileProviderError(.cannotSynchronize))
+                return
+            }
+            let merged = ChangeSet(mergingUpdated: [changes.createdAndUpdated, pending], deleted: [changes.deleted])
+            let sortedUpdated = merged.createdAndUpdated.sorted {
+                let lhs = $0.remotePath()
+                let rhs = $1.remotePath()
+                return lhs.count == rhs.count ? lhs < rhs : lhs.count < rhs.count
+            }
             changeBuffer.prime(
                 key: anchorKey,
-                finalAnchorRawValue: anchor.rawValue,
+                finalAnchorRawValue: targetAnchor.rawValue,
                 updated: sortedUpdated,
-                deleted: changes.deleted
+                deleted: merged.deleted
             )
 
             drainChangeBuffer(
                 for: observer,
-                finalAnchor: anchor,
+                finalAnchor: targetAnchor,
                 suggested: observer.suggestedBatchSize
             )
         }

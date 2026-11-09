@@ -341,12 +341,28 @@ extension NextcloudKit: RemoteInterface {
 
     public func tryAuthenticationAttempt(
         account: Account,
-        options _: NKRequestOptions = .init(),
-        taskHandler _: @escaping (_ task: URLSessionTask) -> Void = { _ in }
+        options: NKRequestOptions = .init(),
+        taskHandler: @escaping (_ task: URLSessionTask) -> Void = { _ in }
     ) async -> AuthenticationAttemptResultState {
-        // Test by trying to fetch user profile
-        let (_, _, _, error) =
-            await enumerate(remotePath: account.davFilesUrl + "/", depth: .target, account: account)
+        // Check access to the WebDAV root using the caller's timeout and interceptor settings.
+        var (_, _, _, error) =
+            await enumerate(remotePath: account.davFilesUrl + "/", depth: .target, account: account, options: options, taskHandler: taskHandler)
+
+        // A freshly launched extension can briefly report offline while its network path starts.
+        // Retry that transport condition once; HTTP failures and timeouts still return immediately.
+        if error.errorCode == NSURLErrorNotConnectedToInternet {
+            nkLog(info: "Retrying the initial offline authentication check once.")
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return .connectionError
+            }
+            let retry = await enumerate(
+                remotePath: account.davFilesUrl + "/", depth: .target,
+                account: account, options: options, taskHandler: taskHandler
+            )
+            error = retry.error
+        }
 
         if error != .success {
             nkLog(error: "Error in auth check: \(error.errorDescription)")

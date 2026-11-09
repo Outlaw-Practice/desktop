@@ -28,7 +28,7 @@ extension NKError {
     var isCouldntConnectError: Bool {
         errorCode == -9999 || errorCode == -1001 || errorCode == -1004 || errorCode == -1005
             || errorCode == -1009 || errorCode == -1012 || errorCode == -1200 || errorCode == -1202
-            || errorCode == 500 || errorCode == 503 || errorCode == 200
+            || errorCode == 500 || errorCode == 502 || errorCode == 503 || errorCode == 504 || errorCode == 200
     }
 
     var isUnauthenticatedError: Bool {

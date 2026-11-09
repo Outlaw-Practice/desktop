@@ -20,7 +20,7 @@ extension NextcloudKit {
         )
     }
 
-    private func clearAccountErrorState(for identifier: String) {
+    func clearAccountErrorState(for identifier: String) {
         let nkCommon = nkCommonInstance
         guard let groupDefaults = UserDefaults(suiteName: nkCommon.groupIdentifier) else {
             return

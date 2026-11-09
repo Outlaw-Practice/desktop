@@ -775,6 +775,18 @@
         }
       }
     },
+    "Could not connect to Nextcloud. Check your network and try again." : {
+      "comment" : "Authentication connection failure shown in Finder. Ask the user to check connectivity and retry sign-in.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not connect to Nextcloud. Check your network and try again."
+          }
+        }
+      }
+    },
     "File actions" : {
       "comment" : "Context menu item label.",
       "extractionState" : "manual",

@@ -50,15 +50,38 @@ extension Enumerator {
                 changeBuffer.reset()
                 logger.debug("Working-set change buffer not primed for anchor \(anchorKey); deriving changes.", [.account: account])
 
-                let serverChanges = await scanMaterialisedItemsForRemoteChanges()
-                // A failed local read is treated like a failed server scan: the incoming anchor is kept so the changes are retried on the next signal.
-                let localChanges = dbManager.pendingWorkingSetChanges(since: date)
+                let serverChanges: WorkingSetRefreshState.Snapshot
+                if let workingSetRefresh {
+                    serverChanges = workingSetRefresh.changes(since: date, scan: { progress in
+                        let result = await self.scanMaterialisedItemsForRemoteChanges(onProgress: progress)
+                        return .init(updated: result.updated, deleted: result.deleted, hadFailure: result.hadFailure)
+                    }, signal: {
+                        guard let domain = self.domain else { return }
+                        NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { _ in }
+                    })
+                } else {
+                    let result = await scanMaterialisedItemsForRemoteChanges()
+                    serverChanges = .init(updated: result.updated, deleted: result.deleted,
+                                          completedAt: Date(),
+                                          hadFailure: result.hadFailure)
+                }
+                let localChanges = workingSetRefresh == nil
+                    ? dbManager.pendingWorkingSetChanges(since: date)
+                    : dbManager.pendingReachableWorkingSetChanges(since: date)
                 let pendingLocalChanges = localChanges ?? ([], [])
-                let hadFailure = serverChanges.hadFailure || localChanges == nil
+                var incomplete = serverChanges.completedAt == nil || serverChanges.hadFailure || localChanges == nil
 
+                // Other readers and local edits can advance rows while the background scan runs.
+                // Resolve its identifiers against the current rows instead of replaying an older version.
+                let remoteUpdates = workingSetRefresh == nil ? serverChanges.updated : serverChanges.updated.compactMap {
+                    dbManager.itemMetadata(NSFileProviderItemIdentifier($0.ocId))
+                }.filter { !$0.deleted }
+                let remoteDeletions = workingSetRefresh == nil ? serverChanges.deleted : serverChanges.deleted.compactMap {
+                    dbManager.itemMetadata(NSFileProviderItemIdentifier($0.ocId))
+                }.filter(\.deleted)
                 let changes = ChangeSet(
-                    mergingUpdated: [serverChanges.updated, pendingLocalChanges.updated],
-                    deleted: [serverChanges.deleted, pendingLocalChanges.deleted]
+                    mergingUpdated: [pendingLocalChanges.updated, remoteUpdates],
+                    deleted: serverChanges.completedAt == nil ? [] : [remoteDeletions, pendingLocalChanges.deleted]
                 )
 
                 // Sort created+updated by remote-path length (ascending) so parent directories are
@@ -67,16 +90,25 @@ extension Enumerator {
                 // to house a child before it processes the parent rename, briefly leaving both the old
                 // and new folder names on disk.
                 // Paths of equal length are ordered by path, so the order does not depend on which scan read finished first.
-                let sortedUpdated = changes.createdAndUpdated
+                let eligibleUpdates: [SendableItemMetadata]
+                if serverChanges.completedAt == nil {
+                    let safeUpdates = dbManager.updatesWithoutPathReplacements(changes.createdAndUpdated)
+                    eligibleUpdates = safeUpdates ?? []
+                    incomplete = incomplete || safeUpdates == nil
+                } else {
+                    eligibleUpdates = changes.createdAndUpdated
+                }
+                let sortedUpdated = eligibleUpdates
                     .sorted { ($0.remotePath().count, $0.remotePath()) < ($1.remotePath().count, $1.remotePath()) }
 
-                let finalAnchor = hadFailure ? anchor : currentAnchor
+                let finalAnchor = incomplete ? anchor : (workingSetRefresh == nil
+                    ? currentAnchor : syncAnchor(at: serverChanges.completedAt!))
                 changeBuffer.prime(
                     key: anchorKey,
                     finalAnchorRawValue: finalAnchor.rawValue,
                     updated: sortedUpdated,
                     deleted: changes.deleted,
-                    incomplete: hadFailure
+                    incomplete: incomplete
                 )
             }
 
@@ -112,7 +144,9 @@ extension Enumerator {
     /// - Returns: The discovered creations and updates (combined into `updated`) and the items that
     ///   were marked deleted.
     ///
-    func scanMaterialisedItemsForRemoteChanges() async -> (
+    func scanMaterialisedItemsForRemoteChanges(
+        onProgress: @escaping @Sendable ([SendableItemMetadata]) -> Void = { _ in }
+    ) async -> (
         updated: [SendableItemMetadata], deleted: [SendableItemMetadata], hadFailure: Bool
     ) {
         logger.debug("Checking materialised items for changes on the server...")
@@ -215,6 +249,9 @@ extension Enumerator {
                     accumulatedDeletions += changes.deleted
                     accumulatedUpdates += changes.updated
                     accumulatedCreations += changes.created
+                    if !changes.updated.isEmpty || !changes.created.isEmpty {
+                        onProgress(accumulatedCreations + accumulatedUpdates)
+                    }
 
                     // Reading a directory's children does not by itself require scanning each child's own
                     // children. Track which children this read has already accounted for.
