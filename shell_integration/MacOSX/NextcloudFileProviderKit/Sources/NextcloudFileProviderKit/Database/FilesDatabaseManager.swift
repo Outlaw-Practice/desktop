@@ -951,6 +951,48 @@ public final class FilesDatabaseManager: Sendable {
         return (updatedItems, deletedItems)
     }
 
+    /// Include changes persisted by a previous scan, even if its parent etag was unchanged.
+    func pendingReachableWorkingSetChanges(since date: Date) -> (updated: [SendableItemMetadata], deleted: [SendableItemMetadata]) {
+        let materialised = managedMaterialisedItemMetadatas().toUnmanagedResults()
+        let identifiers = Set(materialised.map(\.ocId))
+        var paths = Set<String>()
+        for item in materialised {
+            var path = item.directory ? item.remotePath() : item.serverUrl
+            while path.count >= account.davFilesUrl.count {
+                paths.insert(path)
+                guard let slash = path.lastIndex(of: "/") else { break }
+                path = String(path[..<slash])
+            }
+        }
+        let rows = itemMetadatas.where { $0.syncTime > date }.toUnmanagedResults().filter {
+            !($0.isTrashed || $0.isLockFileOfLocalOrigin) && (identifiers.contains($0.ocId) || paths.contains($0.serverUrl))
+        }
+        let prior = pendingWorkingSetChanges(since: date)
+        let changes = ChangeSet(mergingUpdated: [prior.updated, rows.filter { !$0.deleted }],
+                                deleted: [prior.deleted, rows.filter(\.deleted)])
+        return (changes.createdAndUpdated, changes.deleted)
+    }
+
+    /// A replacement at the same path must wait until deletion reconciliation completes.
+    func updatesWithoutPathReplacements(_ updates: [SendableItemMetadata]) -> [SendableItemMetadata] {
+        updates.filter { item in
+            itemMetadatas.filter("serverUrl == %@ AND normalizedFileName ==[c] %@", item.serverUrl, item.fileName.precomposedStringWithCanonicalMapping).count == 1
+        }
+    }
+
+    /// Updates a visible container still needs after another reader persisted its server snapshot.
+    /// Same-path identity replacements wait for their ordinary deletion reconciliation.
+    func pendingContainerUpdates(serverUrl: String, since date: Date) -> [SendableItemMetadata] {
+        let siblings = itemMetadatas.where {
+            RealmItemMetadata.hasServerUrl($0, equalTo: serverUrl, includingDescendants: false)
+        }
+        return siblings.where { !$0.deleted && $0.syncTime > date }.compactMap { row in
+            guard siblings.filter("normalizedFileName ==[c] %@", row.normalizedFileName).count == 1 else { return nil }
+            let metadata = SendableItemMetadata(value: row)
+            return metadata.isLockFileOfLocalOrigin ? nil : metadata
+        }
+    }
+
     public func itemsMetadataByFileNameSuffix(suffix: String) -> [SendableItemMetadata] {
         logger.debug("Trying to find files matching pattern \"\(suffix)\".")
 

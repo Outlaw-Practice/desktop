@@ -14,7 +14,7 @@ enum FileProviderErrorCode: Int {
     var localizedDescription: String {
         switch self {
             case .connection:
-                String(localized: "There was a network connection error.")
+                String(localized: "Could not connect to Nextcloud. Check your network and try again.")
             case .invalidCredentials:
                 String(localized: "Authentication failed due to invalid credentials.")
             case .missingAccountInformation:
@@ -28,6 +28,6 @@ extension NSError {
     /// Convenience initializer for custom error objects to pass over XPC.
     ///
     convenience init(_ code: FileProviderErrorCode) {
-        self.init(domain: Bundle.main.bundleIdentifier!, code: code.rawValue, userInfo: [NSLocalizedDescriptionKey: code.localizedDescription])
+        self.init(domain: Bundle.main.bundleIdentifier ?? "com.nextcloud.desktopclient.FileProviderExt", code: code.rawValue, userInfo: [NSLocalizedDescriptionKey: code.localizedDescription])
     }
 }

@@ -61,13 +61,19 @@ final class ItemCreateTests: NextcloudFileProviderKitTestCase {
     var rootItem: MockRemoteItem!
     static let dbManager = FilesDatabaseManager(account: account, databaseDirectory: makeDatabaseDirectory(), fileProviderDomainIdentifier: NSFileProviderDomainIdentifier("test"), log: FileProviderLogMock())
 
+    // Async reads may leave the autorelease pool that opened the in-memory store.
+    private var retainedRealm: Realm?
+
     override func setUp() {
         super.setUp()
+        _ = Self.dbManager
         Realm.Configuration.defaultConfiguration.inMemoryIdentifier = name
+        retainedRealm = try! Realm()
         rootItem = MockRemoteItem.rootItem(account: Self.account)
     }
 
     override func tearDown() {
+        defer { retainedRealm = nil }
         rootItem.children = []
     }
 

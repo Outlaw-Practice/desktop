@@ -588,7 +588,13 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
     public var forceNextPageOnLastContentPage: Bool = false
 
     /// Track the number of read operations performed
-    public var readOperationCount: Int = 0
+    private let readCountLock = NSLock()
+    private var storedReadOperationCount = 0
+    public var readOperationCount: Int {
+        get { readCountLock.withLock { storedReadOperationCount } }
+        set { readCountLock.withLock { storedReadOperationCount = newValue } }
+    }
+    public var enumerateSuspensionHandler: (@Sendable (String) async -> Void)?
 
     /// When non-nil, the upload mock truncates the modification date returned to
     /// the caller to this precision (in seconds) — simulating Nextcloud's
@@ -1184,7 +1190,8 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
         taskHandler: @escaping (URLSessionTask) -> Void = { _ in }
     ) async -> (account: String, files: [NKFile], data: AFDataResponse<Data>?, error: NKError) {
         // Increment read operation counter
-        readOperationCount += 1
+        readCountLock.withLock { storedReadOperationCount += 1 }
+        await enumerateSuspensionHandler?(remotePath)
 
         var remotePath = remotePath
 

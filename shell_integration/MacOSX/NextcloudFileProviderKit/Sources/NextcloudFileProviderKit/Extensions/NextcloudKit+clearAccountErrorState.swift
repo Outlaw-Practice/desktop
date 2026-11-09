@@ -17,7 +17,7 @@ extension NextcloudKit {
     ///
     static func clearAccountErrorState(for identifier: String) {
         let nkCommon = NextcloudKit.shared.nkCommonInstance
-        let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "NextcloudKit+clearAccountErrorState")
+        let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.nextcloud.desktopclient.FileProviderExt", category: "NextcloudKit+clearAccountErrorState")
 
         logger.debug("Attempt to clear account error state for account identifier: \"\(identifier)\"...")
 

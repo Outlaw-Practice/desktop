@@ -12,8 +12,8 @@ import NextcloudKit
 /// ``enumeratedItemIdentifier``:
 ///
 /// - **Working set** (`.workingSet`): the items the system keeps track of — visited folders and
-///   downloaded files. This is the only container a change notification ever signals (the app calls
-///   `signalEnumerator(for: .workingSet)`), so working-set change enumeration is what drives remote
+///   downloaded files. The app signals this collection for background changes, while active directory
+///   observers can refresh independently. Working-set change enumeration drives background remote
 ///   updates into the framework. See ``scanMaterialisedItemsForRemoteChanges()``.
 /// - **Trash** (`.trashContainer`): items deleted on this device. See the `Trash` extension.
 /// - **Regular directory**: a normal folder, read from the server and (for changes) diffed against
@@ -54,6 +54,7 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
     /// Stores pending changes between File Provider requests. The changes are stored in Realm so a new
     /// enumerator can resume the next batch.
     let changeBuffer: ChangeDeliveryBuffer
+    let workingSetRefresh: WorkingSetRefreshState?
 
     /// Default number of items reported per page/batch when the system does not suggest one. Mirrors the
     /// per-page item budget used for paginated item enumeration (``pageItemCount``).
@@ -77,6 +78,7 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
         dbManager: FilesDatabaseManager,
         domain: NSFileProviderDomain? = nil,
         pageSize: Int = 1000,
+        workingSetRefresh: WorkingSetRefreshState? = nil,
         log: any FileProviderLogging
     ) throws {
         self.enumeratedItemIdentifier = enumeratedItemIdentifier
@@ -84,6 +86,7 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
         self.account = account
         self.dbManager = dbManager
         self.domain = domain
+        self.workingSetRefresh = workingSetRefresh
         pageItemCount = pageSize
         logger = FileProviderLogger(category: "Enumerator", log: log)
         changeBuffer = ChangeDeliveryBuffer(
@@ -159,7 +162,7 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
             } else if enumeratedItemIdentifier == .trashContainer {
                 enumerateTrashChanges(for: observer, anchor: anchor)
             } else {
-                enumerateContainerChanges(for: observer, anchor: anchor)
+                enumerateContainerChanges(for: observer, since: Date(), anchor: anchor)
             }
             return
         }
@@ -176,7 +179,7 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
         } else if enumeratedItemIdentifier == .trashContainer {
             enumerateTrashChanges(for: observer, anchor: anchor)
         } else {
-            enumerateContainerChanges(for: observer, anchor: anchor)
+            enumerateContainerChanges(for: observer, since: anchorDate, anchor: anchor)
         }
     }
 

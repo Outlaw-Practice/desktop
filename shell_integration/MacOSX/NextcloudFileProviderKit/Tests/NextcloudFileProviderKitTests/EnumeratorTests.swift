@@ -27,9 +27,19 @@ final class EnumeratorTests: NextcloudFileProviderKitTestCase {
 
     static let dbManager = FilesDatabaseManager(account: account, databaseDirectory: makeDatabaseDirectory(), fileProviderDomainIdentifier: NSFileProviderDomainIdentifier("test"), log: FileProviderLogMock())
 
+    // Keep the in-memory store alive across asynchronous enumeration callbacks.
+    private var retainedRealm: Realm?
+
+    override func tearDown() {
+        retainedRealm = nil
+        super.tearDown()
+    }
+
     override func setUp() {
         super.setUp()
+        _ = Self.dbManager
         Realm.Configuration.defaultConfiguration.inMemoryIdentifier = name
+        retainedRealm = try! Realm()
 
         rootItem = MockRemoteItem.rootItem(account: Self.account)
 
@@ -2579,7 +2589,13 @@ final class EnumeratorTests: NextcloudFileProviderKitTestCase {
         }
         XCTAssertEqual(observer.finishes.last?.moreComing, false)
 
-        // Delivered orphans are soft-deleted by the time their batch finishes.
+        // Acknowledgement follows finishEnumeratingChanges, so wait for its database effect.
+        let acknowledgementDeadline = ContinuousClock().now + .seconds(2)
+        while expectedOcIds.contains(where: { Self.dbManager.itemMetadata(ocId: $0)?.deleted != true }),
+              ContinuousClock().now < acknowledgementDeadline
+        {
+            await Task.yield()
+        }
         for ocId in expectedOcIds {
             XCTAssertEqual(Self.dbManager.itemMetadata(ocId: ocId)?.deleted, true, "Delivered trash orphans must be soft-deleted.")
         }

@@ -61,6 +61,34 @@ private final class EnumeratePathRecorder: @unchecked Sendable {
     }
 }
 
+private actor HeldWorkingSetReads {
+    let entered: XCTestExpectation
+    var active = 0
+    var maximum = 0
+    var arrivals = 0
+    var released = false
+    var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(entered: XCTestExpectation) { self.entered = entered }
+
+    func hold() async {
+        active += 1
+        arrivals += 1
+        maximum = max(maximum, active)
+        if arrivals <= 6 { entered.fulfill() }
+        if !released {
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        active -= 1
+    }
+
+    func release() {
+        released = true
+        for waiter in waiters { waiter.resume() }
+        waiters.removeAll()
+    }
+}
+
 final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
     static let account = Account(
         user: "testUser", id: "testUserId", serverUrl: "https://mock.nc.com", password: "abcd"
@@ -165,10 +193,437 @@ final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
     }
 
     // MARK: - Tests
+    /// Same 716-folder workload as the live trace; mocked network delay is scaled to 20 ms.
+    /// Measures time to a completed response containing a changed file, not only didUpdate.
+    func testWorkingSetDeliveryLatencyBenchmark() async throws {
+        let folder = makeFolder(name: "a", parent: rootItem, etag: "same")
+        let unrelated = (0..<715).map { makeFolder(name: "unrelated-\($0)", parent: rootItem, etag: "same") }
+        ([folder] + unrelated).forEach { seed($0, visitedDirectory: true) }
+        let file = makeFile(name: "benchmark.txt", parent: folder, etag: "v0")
+        let remote = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        remote.enumerateSuspensionHandler = { _ in try? await Task.sleep(for: .milliseconds(20)) }
+        for iteration in 0..<2 {
+            seed(file)
+            file.versionIdentifier = "baseline-\(iteration)"
+            let baselineStart = Date()
+            let baseline = try await runWorkingSetChanges(remote)
+            let baselineSeconds = Date().timeIntervalSince(baselineStart)
+            XCTAssertTrue(reportedIds(baseline).contains(file.identifier))
+            seed(file)
+            file.versionIdentifier = "incremental-\(iteration)"
+            let state = WorkingSetRefreshState()
+            let start = Date()
+            var received = false
+            for _ in 0..<300 {
+                let enumerator = try Enumerator(enumeratedItemIdentifier: .workingSet, account: Self.account,
+                    remoteInterface: remote, dbManager: Self.dbManager, workingSetRefresh: state, log: FileProviderLogMock())
+                let observer = MockChangeObserver(enumerator: enumerator)
+                try await observer.enumerateChanges(from: Enumerator.syncAnchor(at: anchorDate))
+                if reportedIds(observer).contains(file.identifier) { received = true; break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let incrementalSeconds = Date().timeIntervalSince(start)
+            await state.waitForCurrentScan()
+            state.requestRefresh()
+            XCTAssertTrue(received)
+            XCTAssertLessThan(incrementalSeconds, baselineSeconds / 2)
+            print(String(format: "DELIVERY_BENCHMARK run=%d folders=716 mock_delay_ms=20 baseline_s=%.3f incremental_s=%.3f", iteration + 1, baselineSeconds, incrementalSeconds))
+        }
+    }
 
-    /// Baseline (sanity): a downloaded (materialized) file that changed on the server is reported.
-    /// Materialized files are PROPFIND'd at `.target` depth and re-stamped every scan, so this is
-    /// expected to PASS — it confirms the harness and the happy path.
+    // A completed change response must not wait for unrelated remote reads.
+    func testIncrementalWorkingSetCompletesWhileOtherReadsAreSuspended() async throws {
+        let fast = makeFolder(name: "a", parent: rootItem, etag: "v1")
+        seed(fast, visitedDirectory: true)
+        let changed = makeFile(name: "web.txt", parent: fast, etag: "v1", data: Data("fixture".utf8))
+        let gone = makeFile(name: "deleted.txt", parent: fast, etag: "v1")
+        var goneMetadata = seed(gone, downloaded: true)
+        goneMetadata.uploaded = true
+        Self.dbManager.addItemMetadata(goneMetadata)
+        fast.children.removeAll { $0.identifier == gone.identifier }
+        let slow = (0..<12).map { makeFolder(name: "slow-folder-\($0)", parent: rootItem, etag: "v1") }
+        slow.forEach { seed($0, visitedDirectory: true) }
+        let entered = expectation(description: "Unrelated reads are suspended")
+        entered.expectedFulfillmentCount = 6
+        let gate = HeldWorkingSetReads(entered: entered)
+        let paths = Set(slow.map(\.remotePath))
+        let remote = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        remote.enumerateSuspensionHandler = { if paths.contains($0) { await gate.hold() } }
+        let state = WorkingSetRefreshState()
+        let anchor = Enumerator.syncAnchor(at: anchorDate)
+        func response() async throws -> MockChangeObserver {
+            let enumerator = try Enumerator(enumeratedItemIdentifier: .workingSet, account: Self.account,
+                remoteInterface: remote, dbManager: Self.dbManager, workingSetRefresh: state, log: FileProviderLogMock())
+            let observer = MockChangeObserver(enumerator: enumerator)
+            try await observer.enumerateChanges(from: anchor)
+            return observer
+        }
+        let first = try await response()
+        XCTAssertEqual(first.finishes.last?.anchor, anchor)
+        await fulfillment(of: [entered], timeout: 5)
+        let partial = try await response()
+        let released = await gate.released
+        XCTAssertFalse(released)
+        XCTAssertTrue(reportedIds(partial).contains(changed.identifier))
+        XCTAssertEqual(partial.finishes.last?.anchor, anchor)
+        XCTAssertTrue(partial.deletedItemIdentifiers.isEmpty)
+        var newer = try XCTUnwrap(Self.dbManager.itemMetadata(NSFileProviderItemIdentifier(changed.identifier)))
+        newer.etag = "newer-local-version"
+        newer.syncTime = Date()
+        Self.dbManager.addItemMetadata(newer)
+        let refreshed = try await response()
+        let current = try XCTUnwrap(refreshed.changedItems.first { $0.itemIdentifier.rawValue == changed.identifier })
+        XCTAssertEqual(current.itemVersion?.contentVersion, Data("newer-local-version".utf8))
+        await gate.release()
+        await state.waitForCurrentScan()
+        let complete = try await response()
+        XCTAssertTrue(reportedIds(complete).contains(changed.identifier))
+        XCTAssertNotEqual(complete.finishes.last?.anchor, anchor)
+        XCTAssertTrue(complete.deletedItemIdentifiers.contains(NSFileProviderItemIdentifier(gone.identifier)))
+        state.requestRefresh()
+    }
+
+    /// A second changed read can arrive immediately after the first. With unrelated reads
+    /// suspended, it must notify the framework rather than wait for the entire scan to finish.
+    func testSuccessiveProgressUpdatesSignalBeforeScanCompletes() async throws {
+        let folder = makeFolder(name: "team", parent: rootItem, etag: "v1")
+        let parent = seed(folder, visitedDirectory: true)
+        let file = makeFile(name: "web-edit.txt", parent: folder, etag: "v2")
+        let child = seed(file, downloaded: true)
+        let state = WorkingSetRefreshState()
+        let entered = expectation(description: "Both changed reads finished; unrelated reads remain suspended")
+        let gate = HeldWorkingSetReads(entered: entered)
+        let signals = EnumeratePathRecorder()
+        _ = state.changes(since: anchorDate, scan: { progress in
+            progress([parent])
+            progress([parent, child])
+            await gate.hold()
+            return .init(updated: [parent, child])
+        }, signal: { signals.add("working-set") })
+        await fulfillment(of: [entered], timeout: 3)
+        let partial = state.changes(since: anchorDate, scan: { _ in
+            XCTFail("Unexpected replacement scan")
+            return .init()
+        }, signal: {})
+        XCTAssertNil(partial.completedAt)
+        XCTAssertTrue(partial.updated.contains { $0.ocId == child.ocId })
+        XCTAssertEqual(signals.paths.count, 2, "The last progress update must signal while the scan is suspended.")
+        await gate.release()
+        await state.waitForCurrentScan()
+        state.requestRefresh()
+    }
+
+    func testNewNotificationCancelsAndSerializesScans() async throws {
+        let folder = makeFolder(name: "fixture", parent: rootItem, etag: "v1")
+        let old = seed(folder, visitedDirectory: true)
+        var new = old
+        new.etag = "new-generation"
+        let latest = new
+        let state = WorkingSetRefreshState()
+        let entered = expectation(description: "First scan entered")
+        let gate = HeldWorkingSetReads(entered: entered)
+        let starts = EnumeratePathRecorder()
+        _ = state.changes(since: anchorDate, scan: { progress in
+            await gate.hold()
+            progress([old])
+            return .init(updated: [old])
+        }, signal: {})
+        await fulfillment(of: [entered], timeout: 3)
+        state.requestRefresh()
+        _ = state.changes(since: anchorDate, scan: { progress in
+            starts.add("new-scan")
+            progress([latest])
+            return .init(updated: [latest])
+        }, signal: {})
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(starts.paths.isEmpty, "Replacement must wait for cancelled reads to finish persisting.")
+        await gate.release()
+        await state.waitForCurrentScan()
+        let snapshot = state.changes(since: anchorDate, scan: { _ in XCTFail("Unexpected rescan"); return .init() }, signal: {})
+        XCTAssertEqual(starts.paths, ["new-scan"])
+        XCTAssertEqual(snapshot.updated.map(\.etag), ["new-generation"])
+        XCTAssertNotNil(snapshot.completedAt)
+        state.requestRefresh()
+    }
+
+    func testCachedUnmaterializedChildSurvivesScanReplacement() async throws {
+        let folder = makeFolder(name: "visited", parent: rootItem, etag: "same-etag")
+        seed(folder, visitedDirectory: true)
+        let child = makeFile(name: "web.txt", parent: folder, etag: "new", data: Data("fixture".utf8))
+        seed(child, syncTime: Date())
+        let entered = expectation(description: "Parent read cannot discover cached child")
+        let gate = HeldWorkingSetReads(entered: entered)
+        let remote = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        let heldPath = folder.remotePath
+        remote.enumerateSuspensionHandler = { if $0 == heldPath { await gate.hold() } }
+        let state = WorkingSetRefreshState()
+        let anchor = Enumerator.syncAnchor(at: anchorDate)
+        let enumerator = try Enumerator(enumeratedItemIdentifier: .workingSet, account: Self.account,
+            remoteInterface: remote, dbManager: Self.dbManager, workingSetRefresh: state, log: FileProviderLogMock())
+        let observer = MockChangeObserver(enumerator: enumerator)
+        try await observer.enumerateChanges(from: anchor)
+        await fulfillment(of: [entered], timeout: 5)
+        XCTAssertTrue(reportedIds(observer).contains(child.identifier), "A fresh working-set state must replay the cached child before the scan can discover it.")
+        XCTAssertEqual(observer.finishes.last?.anchor, anchor)
+        XCTAssertTrue(observer.deletedItemIdentifiers.isEmpty)
+        let released = await gate.released
+        XCTAssertFalse(released)
+        await gate.release()
+        await state.waitForCurrentScan()
+        state.requestRefresh()
+    }
+
+    func testPartialUpdatesDeferCaseInsensitiveIdentityReplacement() {
+        let folder = makeFolder(name: "visited", parent: rootItem, etag: "v1")
+        seed(folder, visitedDirectory: true)
+        let old = makeFile(name: "Report.txt", parent: folder, etag: "old", data: Data())
+        var tombstone = seed(old)
+        tombstone.deleted = true
+        Self.dbManager.addItemMetadata(tombstone)
+        let replacement = makeFile(name: "report.txt", parent: folder, etag: "new", data: Data())
+        let metadata = seed(replacement, syncTime: Date())
+        XCTAssertTrue(Self.dbManager.updatesWithoutPathReplacements([metadata]).isEmpty)
+    }
+
+
+    /// A queued child must wait for its parent without leaving other read slots idle.
+    func testWorkingSetReadsIndependentFoldersWithBoundedConcurrency() async throws {
+        let folders = [makeFolder(name: "a", parent: rootItem, etag: "v1")]
+            + (0..<5).map { makeFolder(name: "unrelated-folder-\($0)", parent: rootItem, etag: "v1") }
+        for folder in folders { seed(folder, visitedDirectory: true) }
+        let child = makeFolder(name: "nested", parent: folders[0], etag: "v1")
+        seed(child, visitedDirectory: true)
+        let paths = Set(folders.map(\.remotePath))
+        let entered = expectation(description: "Six independent reads entered")
+        entered.expectedFulfillmentCount = 6
+        let gate = HeldWorkingSetReads(entered: entered)
+        let remote = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        remote.enumerateSuspensionHandler = { path in
+            if paths.contains(path) { await gate.hold() }
+        }
+        let enumerator = try Enumerator(
+            enumeratedItemIdentifier: .workingSet, account: Self.account,
+            remoteInterface: remote, dbManager: Self.dbManager, log: FileProviderLogMock()
+        )
+        let anchor = Enumerator.syncAnchor(at: anchorDate)
+        let enumeration = Task {
+            let observer = MockChangeObserver(enumerator: enumerator)
+            try await observer.enumerateChanges(from: anchor)
+            return observer
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        await gate.release()
+        let observer = try await enumeration.value
+        let maximum = await gate.maximum
+        XCTAssertNil(observer.error)
+        XCTAssertEqual(maximum, 6)
+        // The parent's depth-1 read covers its unchanged, childless child.
+        XCTAssertEqual(remote.readOperationCount, 6)
+    }
+
+    func testSlowReadDoesNotLeaveOtherWorkingSetReadSlotsIdle() async throws {
+        let folders = (1...7).map {
+            makeFolder(name: String(repeating: "a", count: $0), parent: rootItem, etag: "v1")
+        }
+        for folder in folders { seed(folder, visitedDirectory: true) }
+        let entered = expectation(description: "Slow read entered")
+        let refilled = expectation(description: "A freed slot starts the seventh read")
+        let gate = HeldWorkingSetReads(entered: entered)
+        let progress = EnumeratePathRecorder()
+        let slowPath = folders[0].remotePath
+        let lastPath = folders[6].remotePath
+        let remote = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        remote.enumerateSuspensionHandler = { path in
+            if path == slowPath { await gate.hold() }
+            if path == lastPath {
+                progress.add(await gate.released ? "waited-for-slow-read" : "refilled-while-slow")
+                refilled.fulfill()
+            }
+        }
+        let enumerator = try Enumerator(
+            enumeratedItemIdentifier: .workingSet, account: Self.account,
+            remoteInterface: remote, dbManager: Self.dbManager, log: FileProviderLogMock()
+        )
+        let anchor = Enumerator.syncAnchor(at: anchorDate)
+        let enumeration = Task {
+            let observer = MockChangeObserver(enumerator: enumerator)
+            try await observer.enumerateChanges(from: anchor)
+            return observer
+        }
+        await fulfillment(of: [entered, refilled], timeout: 3)
+        await gate.release()
+        let observer = try await enumeration.value
+        XCTAssertNil(observer.error)
+        XCTAssertEqual(progress.paths, ["refilled-while-slow"])
+        XCTAssertEqual(remote.readOperationCount, 7)
+    }
+
+    func testVisibleContainerReportsWebFileAlreadyReadByWorkingSet() async throws {
+        let folder = makeFolder(name: "visible-folder", parent: rootItem, etag: "folder-v1")
+        seed(folder, visitedDirectory: true)
+        let remote = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        let container = try Enumerator(
+            enumeratedItemIdentifier: .init(folder.identifier), account: Self.account,
+            remoteInterface: remote, dbManager: Self.dbManager, log: FileProviderLogMock()
+        )
+        let created = makeFile(name: "new-web-file", parent: folder, etag: "new-v1")
+        // The working set has persisted this server result, but has not finished its long scan.
+        let read = await Enumerator.readServerUrl(
+            folder.remotePath, account: Self.account, remoteInterface: remote,
+            dbManager: Self.dbManager, log: FileProviderLogMock()
+        )
+        XCTAssertTrue(read.changes?.created.contains { $0.ocId == created.identifier } == true)
+        let observer = MockChangeObserver(enumerator: container)
+        try await observer.enumerateChanges(from: Enumerator.syncAnchor(at: anchorDate))
+        XCTAssertNil(observer.error)
+        XCTAssertTrue(reportedIds(observer).contains(created.identifier),
+                      "A visible folder must report the web file even when the working set wrote its metadata first.")
+        XCTAssertNotEqual(observer.finishes.last?.anchor.rawValue, Enumerator.syncAnchor(at: anchorDate).rawValue)
+    }
+
+    func testSameFolderSnapshotReadsDoNotOverlap() async {
+        let coordinator = RemoteReadCoordinator()
+        let progress = EnumeratePathRecorder()
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<64 {
+                group.addTask {
+                    _ = await coordinator.perform(key: "same-folder") {
+                        progress.add("start")
+                        await Task.yield()
+                        progress.add("end")
+                        return RemoteReadResult()
+                    }
+                }
+            }
+        }
+        XCTAssertEqual(progress.paths, Array(repeating: ["start", "end"], count: 64).flatMap { $0 })
+    }
+
+    func testCancelledQueuedFolderReadDoesNotRunOrBlockItsSuccessor() async {
+        let coordinator = RemoteReadCoordinator()
+        let entered = expectation(description: "The first folder read is running")
+        let gate = HeldWorkingSetReads(entered: entered)
+        let calls = EnumeratePathRecorder()
+        let first = Task {
+            await coordinator.perform(key: "folder") {
+                await gate.hold()
+                return RemoteReadResult()
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        let cancelled = Task {
+            await coordinator.perform(key: "folder") {
+                calls.add("cancelled-read")
+                return RemoteReadResult()
+            }
+        }
+        cancelled.cancel()
+        await gate.release()
+        _ = await first.value
+        let result = await cancelled.value
+        XCTAssertEqual(result.error, .cancelled)
+        _ = await coordinator.perform(key: "folder") {
+            calls.add("successor")
+            return RemoteReadResult()
+        }
+        XCTAssertEqual(calls.paths, ["successor"])
+    }
+
+    func testCancellingRunningFolderReadCancelsItsOperation() async {
+        let coordinator = RemoteReadCoordinator()
+        let entered = expectation(description: "The folder read is running")
+        let completed = expectation(description: "Cancellation reaches the running operation")
+        let request = Task {
+            await coordinator.perform(key: "folder") {
+                entered.fulfill()
+                do { try await Task.sleep(for: .seconds(60)) } catch {}
+                completed.fulfill()
+                return RemoteReadResult(error: Task.isCancelled ? .cancelled : nil)
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        request.cancel()
+        await fulfillment(of: [completed], timeout: 2)
+        let result = await request.value
+        XCTAssertEqual(result.error, .cancelled)
+    }
+
+    func testPendingContainerUpdatesDeferCaseInsensitiveIdentityReplacement() {
+        let folder = makeFolder(name: "visible", parent: rootItem, etag: "v1")
+        seed(folder, visitedDirectory: true)
+        let old = makeFile(name: "item.txt", parent: folder, etag: "old-v1")
+        seed(old, downloaded: true)
+        folder.children.removeAll { $0.identifier == old.identifier }
+        let replacement = makeFile(name: "ITEM.txt", parent: folder, etag: "new-v1")
+        seed(replacement, syncTime: Date())
+        let pending = Self.dbManager.pendingContainerUpdates(serverUrl: folder.remotePath, since: anchorDate)
+        XCTAssertFalse(pending.contains { $0.ocId == replacement.identifier },
+                       "A cached replacement must wait for the previous identity's deletion to be reconciled.")
+    }
+
+    /// An atomic save can replace an identity at the same case-insensitive local path.
+    /// Its new identity must wait until the old identity's deletion can be reported first.
+    func testAtomicReplacementDoesNotArriveBeforeDeletionReconciliation() async throws {
+        let folder = makeFolder(name: "a", parent: rootItem, etag: "folder-v1")
+        let oldFile = makeFile(name: "item.txt", parent: folder, etag: "old-v1")
+        seed(folder, visitedDirectory: true)
+        seed(oldFile, downloaded: true)
+        folder.children.removeAll { $0.identifier == oldFile.identifier }
+        let replacement = makeFile(name: "ITEM.txt", parent: folder, etag: "new-v1")
+        folder.versionIdentifier = "folder-v2"
+        let slow = (0..<12).map { makeFolder(name: "slow-folder-\($0)", parent: rootItem, etag: "v1") }
+        slow.forEach { seed($0, visitedDirectory: true) }
+        let entered = expectation(description: "Unrelated reads remain suspended")
+        entered.expectedFulfillmentCount = 6
+        let gate = HeldWorkingSetReads(entered: entered)
+        let paths = Set(slow.map(\.remotePath))
+        let remote = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        remote.enumerateSuspensionHandler = { if paths.contains($0) { await gate.hold() } }
+        let state = WorkingSetRefreshState()
+        defer { Task { await gate.release(); state.requestRefresh() } }
+        let anchor = Enumerator.syncAnchor(at: anchorDate)
+        func response() async throws -> MockChangeObserver {
+            let enumerator = try Enumerator(enumeratedItemIdentifier: .workingSet, account: Self.account,
+                remoteInterface: remote, dbManager: Self.dbManager, workingSetRefresh: state, log: FileProviderLogMock())
+            let observer = MockChangeObserver(enumerator: enumerator)
+            try await observer.enumerateChanges(from: anchor)
+            return observer
+        }
+        _ = try await response()
+        await fulfillment(of: [entered], timeout: 5)
+        let partial = try await response()
+        XCTAssertEqual(partial.finishes.last?.anchor, anchor)
+        XCTAssertFalse(reportedIds(partial).contains(replacement.identifier))
+        XCTAssertTrue(partial.deletedItemIdentifiers.isEmpty)
+        await gate.release()
+        await state.waitForCurrentScan()
+        let complete = try await response()
+        XCTAssertTrue(reportedIds(complete).contains(replacement.identifier))
+        XCTAssertTrue(complete.deletedItemIdentifiers.contains(.init(oldFile.identifier)))
+        XCTAssertNotEqual(complete.finishes.last?.anchor, anchor)
+    }
+
+    func testFailedBackgroundScanRetriesOnlyOncePerNotification() async {
+        let state = WorkingSetRefreshState()
+        let calls = EnumeratePathRecorder()
+        let scan: @Sendable (@escaping @Sendable ([SendableItemMetadata]) -> Void) async -> WorkingSetRefreshState.Snapshot = { _ in
+            calls.add("scan")
+            return .init(hadFailure: true)
+        }
+        let signal: @Sendable () -> Void = { calls.add("signal") }
+        _ = state.changes(since: .distantPast, scan: scan, signal: signal)
+        await state.waitForCurrentScan()
+        let start = Date()
+        _ = state.changes(since: .distantPast, scan: scan, signal: signal)
+        await state.waitForCurrentScan()
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1, "A second failure must not schedule another delayed retry.")
+        _ = state.changes(since: .distantPast, scan: scan, signal: signal)
+        await Task.yield()
+        XCTAssertEqual(calls.paths.filter { $0 == "scan" }.count, 2)
+        XCTAssertEqual(calls.paths.filter { $0 == "signal" }.count, 3)
+        state.requestRefresh()
+    }
+
     func testMaterializedFileChangeIsReported() async throws {
         let db = Self.dbManager.ncDatabase(); debugPrint(db)
 

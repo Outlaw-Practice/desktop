@@ -191,6 +191,30 @@ extension Enumerator {
         depth: EnumerateDepth = .targetAndDirectChildren,
         log: any FileProviderLogging
     ) async -> RemoteReadResult {
+        let key = account.ncKitAccount + "|" + serverUrl.precomposedStringWithCanonicalMapping
+        // The SDK enum lacks Sendable; its raw value round-trips across this task boundary.
+        let depthValue = depth.rawValue
+        return await RemoteReadCoordinator.shared.perform(key: key) {
+            await performServerRead(
+                serverUrl, pageSettings: pageSettings, account: account,
+                remoteInterface: remoteInterface, dbManager: dbManager, domain: domain,
+                enumeratedItemIdentifier: enumeratedItemIdentifier,
+                depth: EnumerateDepth(rawValue: depthValue)!, log: log
+            )
+        }
+    }
+
+    private static func performServerRead(
+        _ serverUrl: String,
+        pageSettings: (page: NSFileProviderPage?, index: Int, size: Int)? = nil,
+        account: Account,
+        remoteInterface: RemoteInterface,
+        dbManager: FilesDatabaseManager,
+        domain: NSFileProviderDomain? = nil,
+        enumeratedItemIdentifier: NSFileProviderItemIdentifier? = nil,
+        depth: EnumerateDepth = .targetAndDirectChildren,
+        log: any FileProviderLogging
+    ) async -> RemoteReadResult {
         let logger = FileProviderLogger(category: "Enumerator", log: log)
 
         logger.debug("Starting to read server URL.", [.url: serverUrl])
