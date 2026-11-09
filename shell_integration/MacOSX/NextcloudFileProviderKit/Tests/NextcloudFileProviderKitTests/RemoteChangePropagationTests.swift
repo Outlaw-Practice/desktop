@@ -349,7 +349,26 @@ final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
         seed(folder, visitedDirectory: true)
         let child = makeFile(name: "web.txt", parent: folder, etag: "new", data: Data("fixture".utf8))
         seed(child, syncTime: Date())
-        XCTAssertTrue(try XCTUnwrap(Self.dbManager.pendingReachableWorkingSetChanges(since: anchorDate)).updated.contains { $0.ocId == child.identifier })
+        let entered = expectation(description: "Parent read cannot discover cached child")
+        let gate = HeldWorkingSetReads(entered: entered)
+        let remote = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        let heldPath = folder.remotePath
+        remote.enumerateSuspensionHandler = { if $0 == heldPath { await gate.hold() } }
+        let state = WorkingSetRefreshState()
+        let anchor = Enumerator.syncAnchor(at: anchorDate, storeIdentity: Self.dbManager.storeIdentity)
+        let enumerator = try Enumerator(enumeratedItemIdentifier: .workingSet, account: Self.account,
+            remoteInterface: remote, dbManager: Self.dbManager, workingSetRefresh: state, log: FileProviderLogMock())
+        let observer = MockChangeObserver(enumerator: enumerator)
+        try await observer.enumerateChanges(from: anchor)
+        await fulfillment(of: [entered], timeout: 5)
+        XCTAssertTrue(reportedIds(observer).contains(child.identifier), "A fresh working-set state must replay the cached child before the scan can discover it.")
+        XCTAssertEqual(observer.finishes.last?.anchor, anchor)
+        XCTAssertTrue(observer.deletedItemIdentifiers.isEmpty)
+        let released = await gate.released
+        XCTAssertFalse(released)
+        await gate.release()
+        await state.waitForCurrentScan()
+        state.requestRefresh()
     }
 
     func testPartialUpdatesDeferCaseInsensitiveIdentityReplacement() throws {
