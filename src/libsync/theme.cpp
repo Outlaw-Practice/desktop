@@ -296,7 +296,8 @@ QIcon Theme::themeIcon(const QString &name, bool sysTray) const
 #ifdef Q_OS_MACOS
     if (sysTray && appNameGUI() == u"Outlaw Cloud"_s) {
         const auto trayName = name == u"state-ok"_s ? u"connected"_s : name;
-        const auto path = u"%1%2/outlaw-tray-%3.svg"_s.arg(QString::fromLatin1(themePrefix), systrayIconFlavor(true), trayName);
+        // Keep the approved white compass even when the global appearance is Light.
+        const auto path = u"%1white/outlaw-tray-%2.svg"_s.arg(QString::fromLatin1(themePrefix), trayName);
         if (QFile::exists(path)) {
             // Keep the compass colors even when the mono-icons preference is enabled.
             return QIcon(path);

@@ -101,13 +101,14 @@ private Q_SLOTS:
         auto *theme = OCC::Theme::instance();
         theme->setSystrayUseMonoIcons(mono);
 
-        // Reuse the same theme across appearance changes to catch stale icon caches.
+        // The requested white compass must survive global appearance changes,
+        // including Light mode with a wallpaper that gives the menu bar white symbols.
         for (const auto dark : {false, true, false}) {
             setDarkMenuBar(dark);
             const auto icon = theme->syncStateIcon(OCC::SyncResult::Success, true);
             QVERIFY(!icon.isNull());
             QVERIFY(!icon.isMask()); // A macOS template would discard the green accent.
-            const auto flavor = dark ? u"white"_s : u"black"_s;
+            const auto flavor = u"white"_s;
             const auto expected = renderSvg(u":/client/theme/%1/outlaw-tray-connected.svg"_s.arg(flavor), size);
             const auto actual = icon.pixmap(QSize(size, size), 1.0).toImage().convertToFormat(expected.format());
             QCOMPARE(actual, expected);
@@ -120,8 +121,7 @@ private Q_SLOTS:
                     if (color.alpha() < 128) {
                         continue;
                     }
-                    if (dark ? color.red() >= 230 && color.green() >= 230 && color.blue() >= 230
-                             : color.red() <= 25 && color.green() <= 25 && color.blue() <= 25) {
+                    if (color.red() >= 230 && color.green() >= 230 && color.blue() >= 230) {
                         ++inkPixels;
                     }
                     if (color.green() > color.red() && color.green() > color.blue()) {
@@ -162,7 +162,7 @@ private Q_SLOTS:
                 const auto icon =
                     name == u"state-offline"_s ? theme->folderOfflineIcon(true) : theme->syncStateIcon(static_cast<OCC::SyncResult::Status>(status), true);
                 QVERIFY(!icon.isMask());
-                const auto flavor = dark ? u"white"_s : u"black"_s;
+                const auto flavor = u"white"_s;
                 const auto expected = renderSvg(u":/client/theme/%1/outlaw-tray-%2.svg"_s.arg(flavor, name), 32);
                 QCOMPARE(icon.pixmap(QSize(32, 32), 1.0).toImage().convertToFormat(expected.format()), expected);
 
@@ -172,7 +172,7 @@ private Q_SLOTS:
                 QCOMPARE(nonTray.pixmap(QSize(32, 32), 1.0).toImage().convertToFormat(generic.format()), generic);
 
                 if (name == u"state-error"_s) {
-                    const auto maroon = dark ? QColor(179, 90, 112) : QColor(128, 0, 32);
+                    const auto maroon = QColor(179, 90, 112);
                     const auto actual = icon.pixmap(QSize(72, 72), 1.0).toImage();
                     auto maroonPixels = 0;
                     for (auto y = 0; y < actual.height(); ++y) {
